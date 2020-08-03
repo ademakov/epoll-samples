@@ -7,7 +7,7 @@ main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	ping_pong pp;
+	queued_ping_pong pp;
 	pp.run(
 		[] (address& addr) -> int {
 			int fd = socket(PF_UNIX, SOCK_STREAM, 0);

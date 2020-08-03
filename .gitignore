@@ -1,4 +1,7 @@
 *~
 *.o
-lb-sample
-ud-sample
+lb-simple
+lb-queued
+ud-simple
+ud-queued
+

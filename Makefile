@@ -2,19 +2,19 @@
 CXXFLAGS=-std=c++17 -Wall -O2 -pthread
 LDLIBS=
 
-BINS=lb-sample ud-sample
-HEADERS=fd_queue.h ping_pong.h
+BINS=lb-simple lb-queued ud-simple ud-queued
 
 LINK.o=$(LINK.cc)
 
 .PHONY: all
 all: $(BINS)
 
-lb-sample.o: $(HEADERS)
-ud-sample.o: $(HEADERS)
+lb-queued.o lb-simple.o ud-queued.o ud-simple.o: fd_queue.h ping_pong.h
 
-lb-sample: lb-sample.o
-ud-sample: ud-sample.o
+lb-queued: lb-queued.o
+lb-simple: lb-simple.o
+ud-queued: ud-queued.o
+ud-simple: ud-simple.o
 
 .PHONY: clean
 clean:

@@ -20,12 +20,7 @@
 #include <queue>
 #include <thread>
 
-#define NEVENTS		(128)
-
-#define NPINGERS	(4)
-#define NPONGERS	(3)
-#define NPOLLERS	(1)
-
+#define NEVENTS		(64)
 #define NPSOCKETS	(100)
 #define NMESSAGES	(25000)
 
@@ -55,6 +50,12 @@ struct ping
 	};
 
 	int efd = -1;
+	std::uint64_t stats[NEVENTS + 1];
+
+	ping()
+	{
+		memset(stats, 0, sizeof stats);
+	}
 
 	~ping()
 	{
@@ -62,11 +63,10 @@ struct ping
 			close(efd);
 	}
 
-	static void run(std::function<int(const address&)> connect, const std::vector<address>& addresses)
+	void run(std::function<int(const address&)> connect, const std::vector<address>& addresses)
 	{
-		ping ping;
-		ping.efd = epoll_create(EPOLL_CLOEXEC);
-		if (ping.efd < 0)
+		efd = epoll_create(EPOLL_CLOEXEC);
+		if (efd < 0)
 			error(1, errno, "epoll_create() failed");
 
 		std::queue<connection*> queue;
@@ -75,16 +75,17 @@ struct ping
 			int fd = connect(addresses[i % addresses.size()]);
 			conns[i].fd = fd;
 
-			struct epoll_event ee;
+			::epoll_event ee;
 			ee.events = EPOLLIN;
 			ee.data.ptr = &conns[i];
-			if (epoll_ctl(ping.efd, EPOLL_CTL_ADD, fd, &ee) < 0)
+			if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ee) < 0)
 				error(1, errno, "epoll_ctl() failed 1");
 
 			queue.push(&conns[i]);
 		}
 
 		int total = 0;
+		::epoll_event events[NEVENTS];
 		while (total < (NPSOCKETS * NMESSAGES)) {
 			while (!queue.empty()) {
 				connection *conn = queue.front();
@@ -94,13 +95,13 @@ struct ping
 					error(1, errno, "producer write() failed");
 			}
 
-			struct epoll_event events[NEVENTS];
-			int n = epoll_wait(ping.efd, events, NEVENTS, PINGER_TIMEOUT);
+			int n = epoll_wait(efd, events, NEVENTS, PINGER_TIMEOUT);
 			if (n < 0)
 				error(1, errno, "epoll_wait() failed");
+			stats[n]++;
 
 			for (int i = 0; i < n; i++) {
-				struct epoll_event &e = events[i];
+				::epoll_event &e = events[i];
 				connection *conn = static_cast<connection *>(e.data.ptr);
 
 				char buf[4];
@@ -119,7 +120,105 @@ struct ping
 	}
 };
 
-struct pong
+struct simple_pong
+{
+	int efd = -1;
+	int sfd = -1;
+	std::uint64_t stats[NEVENTS + 1];
+
+	simple_pong()
+	{
+		memset(stats, 0, sizeof stats);
+	}
+
+	~simple_pong()
+	{
+		if (efd >= 0)
+			close(efd);
+		if (sfd >= 0)
+			close(sfd);
+	}
+
+	void init(std::function<int(address&)> setup, address& addr)
+	{
+		sfd = setup(addr);
+
+		if (listen(sfd, 128) < 0)
+			error(1, errno, "listen() failed");
+
+		{
+			int flags = fcntl(sfd, F_GETFL, 0);
+			if (flags < 0)
+				error(1, errno, "fcntl(..., F_GETFL, ...) failed");
+			if (fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0)
+				error(1, errno, "fcntl(..., F_SETFL, ...) failed");
+		}
+
+		efd = epoll_create(EPOLL_CLOEXEC);
+		if (efd < 0)
+			error(1, errno, "epoll_create() failed");
+
+		::epoll_event ee;
+		ee.events = EPOLLIN;
+		ee.data.fd = sfd;
+		if (epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &ee) < 0)
+			error(1, errno, "epoll_ctl() failed");
+	}
+
+	void run(int nsockets)
+	{
+		int closed = 0;
+		::epoll_event ee;
+		::epoll_event events[NEVENTS];
+		do {
+			int n = epoll_wait(efd, events, NEVENTS, POLLER_TIMEOUT);
+			if (n < 0)
+				error(1, errno, "epoll_wait() failed");
+			stats[n]++;
+
+			for (int i = 0; i < n; i++) {
+				::epoll_event &e = events[i];
+				if (e.data.fd == sfd) {
+					for (;;) {
+						int fd = accept(sfd, NULL, NULL);
+						if (fd < 0) {
+							if (errno == EAGAIN || errno == EWOULDBLOCK)
+								break;
+							error(1, errno, "accept() failed");
+						}
+
+						ee.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+						ee.data.fd = fd;
+						if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ee) < 0)
+							error(1, errno, "epoll_ctl() failed");
+					}
+				} else if ((e.events & (EPOLLHUP | EPOLLRDHUP)) != 0) {
+					if (epoll_ctl(efd, EPOLL_CTL_DEL, e.data.fd, &ee) < 0)
+						error(1, errno, "epoll_ctl() failed");
+					close(e.data.fd);
+					++closed;
+				} else {
+					char buf[4];
+					ssize_t len = read(e.data.fd, buf, 4);
+					if (len == 0) {
+						printf("oops, closed %d\n", e.data.fd);
+						continue;
+					}
+
+					if (len < 0)
+						error(1, errno, "consumer read() failed");
+					if (len != 4 || memcmp(buf, "ping", 4) != 0)
+						error(1, 0, "consumer read bad data (%zd)", len);
+
+					if (write(e.data.fd, "pong", 4) != 4)
+						error(1, errno, "consumer write() failed");
+				}
+			}
+		} while (closed < nsockets);
+	}
+};
+
+struct queued_pong
 {
 	static void
 	run(fd_queue<QUEUE_SIZE> &queue)
@@ -161,7 +260,7 @@ struct pong
 
 		poll()
 		{
-			memset(stats, 0, (NEVENTS + 1) * sizeof stats[0]);
+			memset(stats, 0, sizeof stats);
 		}
 
 		~poll()
@@ -191,7 +290,7 @@ struct pong
 			if (efd < 0)
 				error(1, errno, "epoll_create() failed");
 
-			struct epoll_event ee;
+			::epoll_event ee;
 			ee.events = EPOLLIN;
 			ee.data.fd = sfd;
 			if (epoll_ctl(efd, EPOLL_CTL_ADD, sfd, &ee) < 0)
@@ -201,8 +300,8 @@ struct pong
 		void run(int nsockets)
 		{
 			int closed = 0;
-			struct epoll_event ee;
-			struct epoll_event events[NEVENTS];
+			::epoll_event ee;
+			::epoll_event events[NEVENTS];
 			do {
 				int n = epoll_wait(efd, events, NEVENTS, POLLER_TIMEOUT);
 				if (n < 0)
@@ -210,7 +309,7 @@ struct pong
 				stats[n]++;
 
 				for (int i = 0; i < n; i++) {
-					struct epoll_event &e = events[i];
+					::epoll_event &e = events[i];
 					if (e.data.fd == sfd) {
 						for (;;) {
 							int fd = accept(sfd, NULL, NULL);
@@ -239,14 +338,75 @@ struct pong
 	};
 };
 
-struct ping_pong
+struct simple_ping_pong
 {
-	std::thread pollers[NPOLLERS];
-	std::thread pongers[NPONGERS];
+	static constexpr int NPINGERS = 4;
+	static constexpr int NPONGERS = 4;
 
 	void run(std::function<int(address&)> setup, std::function<int(const address&)> connect)
 	{
-		std::vector<pong::poll> polls(NPOLLERS);
+		std::vector<address> addresses(NPONGERS);
+		simple_pong pong_handles[NPONGERS];
+		std::thread pongers[NPONGERS];
+		for (int i = 0; i < NPONGERS; i++) {
+			pong_handles[i].init(setup, addresses[i]);
+
+			int nsockets = (NPSOCKETS / NPONGERS) * NPINGERS;
+			if (i < (NPSOCKETS % NPONGERS))
+				nsockets += NPINGERS;
+
+			pongers[i] = std::thread(&simple_pong::run, &pong_handles[i], nsockets);
+		}
+
+		ping ping_handles[NPINGERS];
+		std::thread pingers[NPINGERS];
+		for (int i = 0; i < NPINGERS; i++)
+			pingers[i] = std::thread(&ping::run, &ping_handles[i], connect, std::cref(addresses));
+
+		for (int i = 0; i < NPINGERS; i++)
+			pingers[i].join();
+		for (int i = 0; i < NPONGERS; i++)
+			pongers[i].join();
+
+		printf(" * pingers\n");
+		std::uint64_t pinger_epoll_calls = 0;
+		for (int i = 0; i < NPINGERS; i++) {
+			printf("epoll stats: [");
+			for (int j = 0; j <= NEVENTS; j++) {
+				pinger_epoll_calls += ping_handles[i].stats[j];
+				printf(" %d=%lu,", j, ping_handles[i].stats[j]);
+			}
+			printf(" ]\n");
+		}
+		printf("epoll calls: %lu\n\n", pinger_epoll_calls);
+
+		printf(" * pongers\n");
+		std::uint64_t ponger_epoll_calls = 0;
+		for (int i = 0; i < NPONGERS; i++) {
+			printf("epoll stats: [");
+			for (int j = 0; j <= NEVENTS; j++) {
+				ponger_epoll_calls += pong_handles[i].stats[j];
+				printf(" %d=%lu,", j, pong_handles[i].stats[j]);
+			}
+			printf(" ]\n");
+		}
+		printf("epoll calls: %lu\n\n", ponger_epoll_calls);
+	}
+};
+
+struct queued_ping_pong
+{
+	static constexpr int NPINGERS = 4;
+	static constexpr int NPONGERS = 3;
+	static constexpr int NPOLLERS = 1;
+
+	void run(std::function<int(address&)> setup, std::function<int(const address&)> connect)
+	{
+		std::thread pingers[NPINGERS];
+		std::thread pollers[NPOLLERS];
+		std::thread pongers[NPONGERS];
+
+		std::vector<queued_pong::poll> polls(NPOLLERS);
 		std::vector<address> addresses(NPOLLERS);
 		for (int i = 0; i < NPOLLERS; i++) {
 			polls[i].init(setup, addresses[i]);
@@ -254,16 +414,21 @@ struct ping_pong
 			int nsockets = (NPSOCKETS / NPOLLERS) * NPINGERS;
 			if (i < (NPSOCKETS % NPOLLERS))
 				nsockets += NPINGERS;
-			pollers[i] = std::thread(&pong::poll::run, &polls[i], nsockets);
+
+			pollers[i] = std::thread(&queued_pong::poll::run, &polls[i], nsockets);
 		}
 
 		for (int i = 0; i < NPONGERS; i++) {
 			static_assert(NPONGERS >= NPOLLERS);
-			pongers[i] = std::thread(&pong::run, std::ref(polls[i % NPOLLERS].queue));
+			pongers[i] = std::thread(&queued_pong::run, std::ref(polls[i % NPOLLERS].queue));
 		}
-		for (int i = 0; i < NPINGERS; i++)
-			std::thread(&ping::run, connect, std::cref(addresses)).detach();
 
+		ping ping_handles[NPINGERS];
+		for (int i = 0; i < NPINGERS; i++)
+			pingers[i] = std::thread(&ping::run, &ping_handles[i], connect, std::cref(addresses));
+
+		for (int i = 0; i < NPINGERS; i++)
+			pingers[i].join();
 		for (int i = 0; i < NPOLLERS; i++)
 			pollers[i].join();
 		for (int i = 0; i < NPONGERS; i++)
@@ -271,12 +436,29 @@ struct ping_pong
 		for (int i = 0; i < NPONGERS; i++)
 			pongers[i].join();
 
+		printf(" * pingers\n");
+		std::uint64_t pinger_epoll_calls = 0;
+		for (int i = 0; i < NPINGERS; i++) {
+			printf("epoll stats: [");
+			for (int j = 0; j <= NEVENTS; j++) {
+				pinger_epoll_calls += ping_handles[i].stats[j];
+				printf(" %d=%lu,", j, ping_handles[i].stats[j]);
+			}
+			printf(" ]\n");
+		}
+		printf("epoll calls: %lu\n\n", pinger_epoll_calls);
+
+		printf(" * pollers\n");
+		std::uint64_t poller_epoll_calls = 0;
 		for (int i = 0; i < NPOLLERS; i++) {
 			printf("queue overflows: %lu\n", polls[i].overflows);
 			printf("epoll stats: [");
-			for (int j = 0; j <= NEVENTS; j++)
+			for (int j = 0; j <= NEVENTS; j++) {
+				poller_epoll_calls += polls[i].stats[j];
 				printf(" %d=%lu,", j, polls[i].stats[j]);
-			printf(" ]\n\n");
+			}
+			printf(" ]\n");
 		}
+		printf("epoll calls: %lu\n\n", poller_epoll_calls);
 	}
 };
